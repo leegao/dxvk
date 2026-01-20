@@ -1,5 +1,8 @@
 #pragma once
 
+#include <optional>
+
+#include "dxvk_barrier.h"
 #include "dxvk_buffer.h"
 #include "dxvk_compute.h"
 #include "dxvk_constant_state.h"
@@ -42,6 +45,7 @@ namespace dxvk {
     GpDirtyStencilRef,          ///< Stencil reference has changed
     GpDirtyMultisampleState,    ///< Multisample state has changed
     GpDirtyRasterizerState,     ///< Cull mode and front face have changed
+    GpDirtySampleLocations,     ///< Sample locations have changed
     GpDirtyViewport,            ///< Viewport state has changed
     GpDirtySpecConstants,       ///< Graphics spec constants are out of date
     GpDynamicBlendConstants,    ///< Blend constants are dynamic
@@ -52,6 +56,7 @@ namespace dxvk {
     GpDynamicStencilTest,       ///< Stencil test state is dynamic
     GpDynamicMultisampleState,  ///< Multisample state is dynamic
     GpDynamicRasterizerState,   ///< Cull mode and front face are dynamic
+    GpDynamicSampleLocations,   ///< Sample locations are dynamic
     GpDynamicVertexStrides,     ///< Vertex buffer strides are dynamic
     GpHasPushData,              ///< Graphics pipeline uses push data
     GpIndependentSets,          ///< Graphics pipeline layout was created with independent sets
@@ -140,6 +145,8 @@ namespace dxvk {
     DxvkRenderPassOps   renderPassOps;
     DxvkFramebufferInfo framebufferInfo;
     DxvkAttachmentMask  attachmentMask;
+    VkOffset2D          renderAreaLo = { };
+    VkOffset2D          renderAreaHi = { };
   };
 
 
@@ -237,4 +244,44 @@ namespace dxvk {
     Rc<DxvkImageView> imageView;
   };
   
+
+  /**
+   * \brief Deferred clear info
+   */
+  struct DxvkClearInfo {
+    Rc<DxvkImageView> view = nullptr;
+    VkAttachmentLoadOp loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentLoadOp loadOpS = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkClearValue clearValue = { };
+    VkImageAspectFlags clearAspects = 0;
+    VkImageAspectFlags discardAspects = 0;
+  };
+
+
+  /**
+   * \brief Deferred clear batch
+   */
+  class DxvkClearBatch {
+
+  public:
+
+    void add(std::optional<DxvkClearInfo>&& info) {
+      if (info)
+        m_batch.push_back(std::move(*info));
+    }
+
+    std::pair<const DxvkClearInfo*, size_t> getRange() const {
+      return std::make_pair(m_batch.begin(), m_batch.size());
+    }
+
+    bool empty() const {
+      return m_batch.empty();
+    }
+
+  private:
+
+    small_vector<DxvkClearInfo, 16u> m_batch;
+
+  };
+
 }

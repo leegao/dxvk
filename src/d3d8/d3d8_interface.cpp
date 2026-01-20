@@ -10,7 +10,7 @@ namespace dxvk {
   D3D8Interface::D3D8Interface()
     : m_d3d9(d3d9::Direct3DCreate9(D3D_SDK_VERSION)) {
     // Get the bridge interface to D3D9.
-    if (FAILED(m_d3d9->QueryInterface(__uuidof(IDxvkD3D8InterfaceBridge), reinterpret_cast<void**>(&m_bridge)))) {
+    if (unlikely(FAILED(m_d3d9->QueryInterface(__uuidof(IDxvkD3D8InterfaceBridge), reinterpret_cast<void**>(&m_bridge))))) {
       throw DxvkError("D3D8Interface: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
     }
 
@@ -75,21 +75,22 @@ namespace dxvk {
     d3d9::D3DADAPTER_IDENTIFIER9 identifier9;
     HRESULT res = m_d3d9->GetAdapterIdentifier(Adapter, Flags, &identifier9);
 
-    if (likely(SUCCEEDED(res))) {
-      strncpy(pIdentifier->Driver, identifier9.Driver, MAX_DEVICE_IDENTIFIER_STRING);
-      strncpy(pIdentifier->Description, identifier9.Description, MAX_DEVICE_IDENTIFIER_STRING);
+    if (unlikely(FAILED(res)))
+      return res;
 
-      pIdentifier->DriverVersion    = identifier9.DriverVersion;
-      pIdentifier->VendorId         = identifier9.VendorId;
-      pIdentifier->DeviceId         = identifier9.DeviceId;
-      pIdentifier->SubSysId         = identifier9.SubSysId;
-      pIdentifier->Revision         = identifier9.Revision;
-      pIdentifier->DeviceIdentifier = identifier9.DeviceIdentifier;
+    strncpy(pIdentifier->Driver, identifier9.Driver, MAX_DEVICE_IDENTIFIER_STRING);
+    strncpy(pIdentifier->Description, identifier9.Description, MAX_DEVICE_IDENTIFIER_STRING);
 
-      pIdentifier->WHQLLevel = identifier9.WHQLLevel;
-    }
+    pIdentifier->DriverVersion    = identifier9.DriverVersion;
+    pIdentifier->VendorId         = identifier9.VendorId;
+    pIdentifier->DeviceId         = identifier9.DeviceId;
+    pIdentifier->SubSysId         = identifier9.SubSysId;
+    pIdentifier->Revision         = identifier9.Revision;
+    pIdentifier->DeviceIdentifier = identifier9.DeviceIdentifier;
 
-    return res;
+    pIdentifier->WHQLLevel = identifier9.WHQLLevel;
+
+    return D3D_OK;
   }
 
   HRESULT __stdcall D3D8Interface::EnumAdapterModes(
@@ -117,8 +118,45 @@ namespace dxvk {
         IDirect3DDevice8** ppReturnedDeviceInterface) {
     InitReturnPtr(ppReturnedDeviceInterface);
 
-    if (unlikely(pPresentationParameters == nullptr ||
-                 ppReturnedDeviceInterface == nullptr))
+    if (unlikely(ppReturnedDeviceInterface == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    HRESULT res = ValidatePresentationParameters(pPresentationParameters);
+
+    if (unlikely(FAILED(res)))
+      return res;
+
+    Com<d3d9::IDirect3DDevice9> pDevice9;
+    d3d9::D3DPRESENT_PARAMETERS params = ConvertPresentParameters9(pPresentationParameters);
+    res = m_d3d9->CreateDevice(
+      Adapter,
+      (d3d9::D3DDEVTYPE)DeviceType,
+      hFocusWindow,
+      BehaviorFlags,
+      &params,
+      &pDevice9
+    );
+
+    if (unlikely(FAILED(res)))
+      return res;
+
+    try {
+      *ppReturnedDeviceInterface = ref(new D3D8Device(
+        this, std::move(pDevice9),
+        DeviceType, hFocusWindow, BehaviorFlags,
+        pPresentationParameters
+      ));
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return D3DERR_NOTAVAILABLE;
+    }
+
+    return D3D_OK;
+  }
+
+  HRESULT D3D8Interface::ValidatePresentationParameters(
+        const D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
     // D3DSWAPEFFECT_COPY can not be used with more than one back buffer.
@@ -134,25 +172,7 @@ namespace dxvk {
               && pPresentationParameters->FullScreen_PresentationInterval != D3DPRESENT_INTERVAL_DEFAULT))
       return D3DERR_INVALIDCALL;
 
-    Com<d3d9::IDirect3DDevice9> pDevice9 = nullptr;
-    d3d9::D3DPRESENT_PARAMETERS params = ConvertPresentParameters9(pPresentationParameters);
-    HRESULT res = m_d3d9->CreateDevice(
-      Adapter,
-      (d3d9::D3DDEVTYPE)DeviceType,
-      hFocusWindow,
-      BehaviorFlags,
-      &params,
-      &pDevice9
-    );
-
-    if (likely(SUCCEEDED(res)))
-      *ppReturnedDeviceInterface = ref(new D3D8Device(
-        this, std::move(pDevice9),
-        DeviceType, hFocusWindow, BehaviorFlags,
-        pPresentationParameters
-      ));
-
-    return res;
+    return D3D_OK;
   }
 
 }

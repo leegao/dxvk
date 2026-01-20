@@ -45,22 +45,29 @@ namespace dxvk {
 
     const bool createImage = m_desc.Pool != D3DPOOL_SYSTEMMEM && m_desc.Pool != D3DPOOL_SCRATCH && m_desc.Format != D3D9Format::NULL_FORMAT;
     if (createImage) {
-      bool plainSurface = m_type == D3DRTYPE_SURFACE &&
-                          !(m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL));
+      m_image = CreatePrimaryImage(ResourceType, pSharedHandle);
 
-      try {
-        m_image = CreatePrimaryImage(ResourceType, plainSurface, pSharedHandle);
+      if (unlikely(m_image == nullptr && (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP))) {
+        // AUTOGENMIPMAP is supposed to be treated like a hint according to the docs.
+        // So if creating an image with it fails, create one without it.
+        m_desc.Usage &= ~D3DUSAGE_AUTOGENMIPMAP;
+        m_desc.MipLevels = 1;
+        m_image = CreatePrimaryImage(ResourceType, pSharedHandle);
       }
-      catch (const DxvkError& e) {
-        // D3DUSAGE_AUTOGENMIPMAP and offscreen plain is mutually exclusive
-        // so we can combine their retry this way.
-        if (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP || plainSurface) {
-          m_desc.Usage &= ~D3DUSAGE_AUTOGENMIPMAP;
-          m_desc.MipLevels = 1;
-          m_image = CreatePrimaryImage(ResourceType, false, pSharedHandle);
-        }
-        else
-          throw e;
+
+      if (unlikely(m_image == nullptr)) {
+        throw DxvkError(str::format(
+          "D3D9: Cannot create texture:",
+          "\n  Type:    0x", std::hex, ResourceType, std::dec,
+          "\n  Format:  ", m_desc.Format,
+          "\n  Extent:  ", m_desc.Width,
+                      "x", m_desc.Height,
+                      "x", m_desc.Depth,
+          "\n  Samples: ", m_desc.MultiSample,
+          "\n  Layers:  ", m_desc.ArraySize,
+          "\n  Levels:  ", m_desc.MipLevels,
+          "\n  Usage:   0x", std::hex, m_desc.Usage, std::dec,
+          "\n  Pool:    0x", std::hex, m_desc.Pool, std::dec));
       }
 
       if (pSharedHandle && *pSharedHandle == nullptr) {
@@ -150,6 +157,12 @@ namespace dxvk {
     ///////////////////
     // Desc Validation
 
+    // Resources can't be created in D3DPOOL_MANAGED
+    // when using extended devices. Note that the D3DPOOL
+    // value of 6 (D3DPOOL_MANAGED_EX) can be used.
+    if (pDevice->IsExtended() && pDesc->Pool == D3DPOOL_MANAGED)
+      return D3DERR_INVALIDCALL;
+
     if (pDesc->Width == 0 || pDesc->Height == 0 || pDesc->Depth == 0)
       return D3DERR_INVALIDCALL;
 
@@ -163,9 +176,31 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
     }
 
+    // Sample counts need to be valid and supported
     VkSampleCountFlagBits sampleCount;
-    if (FAILED(DecodeMultiSampleType(pDevice->GetDXVKDevice(), pDesc->MultiSample, pDesc->MultisampleQuality, &sampleCount)))
+    HRESULT hr = DecodeMultiSampleType(pDesc->MultiSample, pDesc->MultisampleQuality, &sampleCount);
+    if (FAILED(hr))
+      return hr;
+
+    if (ResourceType == D3DRTYPE_SURFACE) {
+      D3DMULTISAMPLE_TYPE d3dSampleCount = D3DMULTISAMPLE_TYPE(sampleCount);
+      // VK_SAMPLE_COUNT_1_BIT = 1 but the D3D9 equivalent we need is D3DMULTISAMPLE_NONE = 0
+      if (d3dSampleCount == D3DMULTISAMPLE_NONMASKABLE)
+        d3dSampleCount = D3DMULTISAMPLE_NONE;
+
+      hr = pDevice->GetAdapter()->CheckDeviceMultiSampleType(
+        D3DDEVTYPE_HAL,
+        pDesc->Format,
+        false,
+        d3dSampleCount,
+        nullptr
+      );
+      if (FAILED(hr))
+        return hr;
+    } else if (sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      // D3D9 only supports MSAA for surfaces
       return D3DERR_INVALIDCALL;
+    }
 
     // Using MANAGED pool with DYNAMIC usage is illegal
     if (IsPoolManaged(pDesc->Pool) && (pDesc->Usage & D3DUSAGE_DYNAMIC))
@@ -213,6 +248,17 @@ namespace dxvk {
     if (ResourceType == D3DRTYPE_VOLUMETEXTURE
       && pDesc->Pool == D3DPOOL_SCRATCH
       && (pDesc->Usage & D3DUSAGE_DYNAMIC))
+      return D3DERR_INVALIDCALL;
+
+    // ATI2 can not be used for render targets, or for
+    // plain surfaces outside of D3DPOOL_SCRATCH in D3D9Ex
+    if (pDesc->Format == D3D9Format::ATI2
+     && (pDesc->Usage & D3DUSAGE_RENDERTARGET ||
+        (pDevice->IsExtended() && isPlainSurface && pDesc->Pool != D3DPOOL_SCRATCH)))
+      return D3DERR_INVALIDCALL;
+
+    // Auto-Mipgen is only valid on textures (for obvious reasons)
+    if ((pDesc->Usage & D3DUSAGE_AUTOGENMIPMAP) && ResourceType == D3DRTYPE_SURFACE)
       return D3DERR_INVALIDCALL;
 
     // Use the maximum possible mip level count if the supplied
@@ -328,7 +374,7 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkImage> D3D9CommonTexture::CreatePrimaryImage(D3DRESOURCETYPE ResourceType, bool TryOffscreenRT, HANDLE* pSharedHandle) const {
+  Rc<DxvkImage> D3D9CommonTexture::CreatePrimaryImage(D3DRESOURCETYPE ResourceType, HANDLE* pSharedHandle) const {
     DxvkImageCreateInfo imageInfo;
     imageInfo.type            = GetImageTypeFromResourceType(ResourceType);
     imageInfo.format          = m_mapping.ConversionFormatInfo.FormatColor != VK_FORMAT_UNDEFINED
@@ -366,13 +412,11 @@ namespace dxvk {
     if (m_mapping.ConversionFormatInfo.FormatType != D3D9ConversionFormat_None) {
       imageInfo.usage  |= VK_IMAGE_USAGE_STORAGE_BIT;
       imageInfo.stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      imageInfo.access |= VK_ACCESS_SHADER_WRITE_BIT;
       imageInfo.shared = true;
     }
 
-    DecodeMultiSampleType(m_device->GetDXVKDevice(), m_desc.MultiSample, m_desc.MultisampleQuality, &imageInfo.sampleCount);
-
-    if (!m_desc.IsAttachmentOnly)
-      imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    DecodeMultiSampleType(m_desc.MultiSample, m_desc.MultisampleQuality, &imageInfo.sampleCount);
 
     // The image must be marked as mutable if it can be reinterpreted
     // by a view with a different format. Depth-stencil formats cannot
@@ -395,8 +439,11 @@ namespace dxvk {
     const bool isDS = m_desc.Usage & D3DUSAGE_DEPTHSTENCIL;
     const bool isAutoGen = m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP;
 
+    if (!m_desc.IsAttachmentOnly || (!isRT && !isDS))
+      imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
     // Are we an RT, need to gen mips or an offscreen plain surface?
-    if (isRT || isAutoGen || TryOffscreenRT) {
+    if (isRT || isAutoGen) {
       imageInfo.usage  |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       imageInfo.stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
       imageInfo.access |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
@@ -429,20 +476,8 @@ namespace dxvk {
       imageInfo.layout = OptimizeLayout(imageInfo.usage);
 
     // Check if we can actually create the image
-    if (!CheckImageSupport(&imageInfo, imageInfo.tiling)) {
-      throw DxvkError(str::format(
-        "D3D9: Cannot create texture:",
-        "\n  Type:    0x", std::hex, ResourceType, std::dec,
-        "\n  Format:  ", m_desc.Format,
-        "\n  Extent:  ", m_desc.Width,
-                    "x", m_desc.Height,
-                    "x", m_desc.Depth,
-        "\n  Samples: ", m_desc.MultiSample,
-        "\n  Layers:  ", m_desc.ArraySize,
-        "\n  Levels:  ", m_desc.MipLevels,
-        "\n  Usage:   0x", std::hex, m_desc.Usage, std::dec,
-        "\n  Pool:    0x", std::hex, m_desc.Pool, std::dec));
-    }
+    if (!CheckImageSupport(&imageInfo, imageInfo.tiling))
+      return nullptr;
 
     return m_device->GetDXVKDevice()->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
@@ -556,8 +591,10 @@ namespace dxvk {
       return VK_IMAGE_LAYOUT_GENERAL;
 
     // Otherwise, pick a layout that can be used for reading.
+    // Use DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL for a DS texture
+    // so it can be used as DS and sampled at the same time without transitioning.
     return (Usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-      ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+      ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
       : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
 
@@ -602,6 +639,43 @@ namespace dxvk {
         return;
     }
 
+    struct d3dkmt_d3d9_desc desc = { };
+    desc.dxgi.size = sizeof(desc);
+    desc.dxgi.version = 1;
+    desc.dxgi.width = m_desc.Width;
+    desc.dxgi.height = m_desc.Height;
+    desc.dxgi.format = dxgiFormat;
+    desc.dxgi.unknown_0 = 1;
+    desc.format = static_cast<D3DFORMAT>(m_desc.Format);
+    desc.type = m_type;
+    desc.usage = m_desc.Usage | 0x8000000;
+
+    switch (m_type) {
+      case D3DRTYPE_TEXTURE:
+        desc.texture.width = m_desc.Width;
+        desc.texture.height = m_desc.Height;
+        desc.texture.levels = m_desc.MipLevels;
+        break;
+      case D3DRTYPE_SURFACE:
+        desc.surface.width = m_desc.Width;
+        desc.surface.height = m_desc.Height;
+        break;
+      default:
+        Logger::warn(str::format("D3D9: Unsupported type for shared textures:", m_type));
+        break;
+    }
+
+    D3DKMT_ESCAPE escape = { };
+    escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
+    escape.pPrivateDriverData = &desc;
+    escape.PrivateDriverDataSize = sizeof(desc);
+    escape.hContext = m_image->storage()->kmtLocal();
+
+    if (!D3DKMTEscape(&escape))
+      return;
+
+    /* try the legacy Proton shared resource implementation */
+
     if (m_desc.Depth == 1 && m_desc.MipLevels == 1 && m_desc.MultiSample == D3DMULTISAMPLE_NONE &&
         m_desc.Usage & D3DUSAGE_RENDERTARGET && dxgiFormat != DXGI_FORMAT_UNKNOWN) {
       HANDLE ntHandle = openKmtHandle(m_image->sharedHandle());
@@ -633,7 +707,7 @@ namespace dxvk {
   Rc<DxvkImageView> D3D9CommonTexture::CreateView(
           UINT                   Layer,
           UINT                   Lod,
-          VkImageUsageFlagBits   UsageFlags,
+          VkImageUsageFlags      UsageFlags,
           VkImageLayout          Layout,
           bool                   Srgb) {
     DxvkImageViewKey viewInfo;
@@ -651,16 +725,16 @@ namespace dxvk {
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(m_mapping.Swizzle);
 
     // Remove the stencil aspect if we are trying to create a regular image
-    // view of a depth stencil format 
-    if (UsageFlags != VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+    // view of a depth stencil format
+    if (!(UsageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
       viewInfo.aspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
 
-    if (UsageFlags == VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT ||
-        UsageFlags == VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+    if (UsageFlags & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
       viewInfo.mipCount = 1;
 
     // Remove swizzle on depth views.
-    if (UsageFlags == VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+    if (UsageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
       viewInfo.packedSwizzle = 0u;
 
     // Create the underlying image view object
@@ -703,17 +777,20 @@ namespace dxvk {
     // that have GENERAL (or FEEDBACK_LOOP) as their layout.
     // This will always be the case for images that can be sampled.
     // So just pick UNDEFINED here.
+
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    // We default to DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL for DS images that can be sampled.
+    // The backend defaults to DS_READ_ONLY, so we need to set the layout explicitly.
+    if (IsDepthStencil())
+      layout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL;
+
     m_sampleView.Color = CreateView(AllLayers, Lod,
-      VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_UNDEFINED, false);
+      VK_IMAGE_USAGE_SAMPLED_BIT, layout, false);
 
     if (IsSrgbCompatible()) {
       m_sampleView.Srgb = CreateView(AllLayers, Lod,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_UNDEFINED, true);
-    }
-
-    if (IsDepthStencil() && GetType() != D3DRTYPE_SURFACE) {
-      m_sampleView.DepthReadOnly = CreateView(AllLayers, Lod,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL, false);
+        VK_IMAGE_USAGE_SAMPLED_BIT, layout, true);
     }
   }
 

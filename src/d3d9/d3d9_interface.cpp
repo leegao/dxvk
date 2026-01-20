@@ -4,6 +4,7 @@
 #include "d3d9_caps.h"
 #include "d3d9_device.h"
 #include "d3d9_bridge.h"
+#include "d3d9_window.h"
 
 #include "../util/util_singleton.h"
 
@@ -18,7 +19,8 @@ namespace dxvk {
     , m_d3d8Bridge  ( this )
     , m_extended    ( bExtended ) 
     , m_d3d9Options ( nullptr, m_instance->config() )
-    , m_d3d9Interop ( this ) {
+    , m_d3d9Interop ( this )
+    , m_d3d9ExtInterface( this ) {
     // D3D9 doesn't enumerate adapters like physical adapters...
     // only as connected displays.
 
@@ -103,6 +105,11 @@ namespace dxvk {
     if (riid == __uuidof(ID3D9VkInteropInterface)
      || riid == __uuidof(ID3D9VkInteropInterface1)) {
       *ppvObject = ref(&m_d3d9Interop);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D9VkExtInterface)) {
+      *ppvObject = ref(&m_d3d9ExtInterface);
       return S_OK;
     }
 
@@ -365,17 +372,20 @@ namespace dxvk {
     if (unlikely(DeviceType == D3DDEVTYPE_SW))
       return D3DERR_INVALIDCALL;
 
-    // D3DDEVTYPE_REF devices can be created with D3D8, but not
-    // with D3D9, unless the Windows SDK 8.0 or later is installed.
-    // Report it unavailable, as it would be on most end-user systems.
-    if (unlikely(DeviceType == D3DDEVTYPE_REF && !m_isD3D8Compatible))
-      return D3DERR_NOTAVAILABLE;
-
     // Creating a device with D3DCREATE_PUREDEVICE only works in conjunction
     // with D3DCREATE_HARDWARE_VERTEXPROCESSING on native drivers.
     if (unlikely(BehaviorFlags & D3DCREATE_PUREDEVICE &&
                !(BehaviorFlags & D3DCREATE_HARDWARE_VERTEXPROCESSING)))
       return D3DERR_INVALIDCALL;
+
+    // Neither D3DDEVTYPE_REF nor D3DDEVTYPE_NULLREF support HWVP, although they
+    // will accept these flags as any regular D3DDEVTYPE_HAL device would.
+    if (unlikely(DeviceType == D3DDEVTYPE_REF || DeviceType == D3DDEVTYPE_NULLREF)) {
+      BehaviorFlags &= ~D3DCREATE_MIXED_VERTEXPROCESSING
+                     & ~D3DCREATE_PUREDEVICE
+                     & ~D3DCREATE_HARDWARE_VERTEXPROCESSING;
+      BehaviorFlags |= D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+    }
 
     HRESULT hr;
     // Black Desert creates a D3DDEVTYPE_NULLREF device and
@@ -405,6 +415,9 @@ namespace dxvk {
         BehaviorFlags,
         dxvkDevice);
 
+      if (!pPresentationParameters->Windowed)
+        ActivateFocusWindow(hFocusWindow ? hFocusWindow : pPresentationParameters->hDeviceWindow);
+
       hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
 
       if (unlikely(FAILED(hr)))
@@ -429,7 +442,36 @@ namespace dxvk {
   }
 
 
-  HRESULT D3D9InterfaceEx::ValidatePresentationParameters(D3DPRESENT_PARAMETERS* pPresentationParameters) {
+  HRESULT D3D9InterfaceEx::ValidatePresentationParametersEx(
+    const D3DPRESENT_PARAMETERS* pPresentationParameters,
+    const D3DDISPLAYMODEEX*      pFullscreenDisplayMode) {
+    if (unlikely(pPresentationParameters == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // pFullscreenDisplayMode must not be NULL in full screen mode.
+    if (unlikely(!pPresentationParameters->Windowed && pFullscreenDisplayMode == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // pFullscreenDisplayMode must be NULL in windowed mode.
+    if (unlikely(pPresentationParameters->Windowed && pFullscreenDisplayMode != nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // On extended devices, the backbuffer dimensions
+    // must match the display mode when in full screen mode.
+    if (unlikely(!pPresentationParameters->Windowed &&
+                  (pPresentationParameters->BackBufferWidth  != pFullscreenDisplayMode->Width
+                || pPresentationParameters->BackBufferHeight != pFullscreenDisplayMode->Height)))
+      return D3DERR_INVALIDCALL;
+
+    return ValidatePresentationParameters(pPresentationParameters);
+  }
+
+
+  HRESULT D3D9InterfaceEx::ValidatePresentationParameters(
+    const D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    if (unlikely(pPresentationParameters == nullptr))
+      return D3DERR_INVALIDCALL;
+
     if (m_extended) {
       // The swap effect value on a D3D9Ex device
       // can not be higher than D3DSWAPEFFECT_FLIPEX.

@@ -29,8 +29,7 @@ namespace dxvk {
 
     robustness2Supported = devFeatures.extRobustness2.robustBufferAccess2;
 
-    sincosEmulation     = options.sincosEmulation;
-    drefScaling         = options.drefScaling;
+    sincosEmulation     = device->getShaderCompileOptions().flags.test(DxvkShaderCompileFlag::LowerSinCos);
   }
 
 }

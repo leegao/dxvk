@@ -581,10 +581,11 @@ namespace dxvk {
 
 
     void cmdBeginRendering(
-      const VkRenderingInfo*        pRenderingInfo) {
-      m_cmd.execCommands = true;
+            DxvkCmdBuffer             cmdBuffer,
+      const VkRenderingInfo*          pRenderingInfo) {
+      m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
 
-      m_vkd->vkCmdBeginRendering(getCmdBuffer(), pRenderingInfo);
+      m_vkd->vkCmdBeginRendering(getCmdBuffer(cmdBuffer), pRenderingInfo);
     }
 
 
@@ -692,11 +693,12 @@ namespace dxvk {
     
     
     void cmdClearAttachments(
+            DxvkCmdBuffer           cmdBuffer,
             uint32_t                attachmentCount,
       const VkClearAttachment*      pAttachments,
             uint32_t                rectCount,
       const VkClearRect*            pRects) {
-      m_vkd->vkCmdClearAttachments(getCmdBuffer(),
+      m_vkd->vkCmdClearAttachments(getCmdBuffer(cmdBuffer),
         attachmentCount, pAttachments, rectCount, pRects);
     }
     
@@ -922,11 +924,12 @@ namespace dxvk {
     }
     
     
-    void cmdEndRendering() {
-      m_vkd->vkCmdEndRendering(getCmdBuffer());
+    void cmdEndRendering(
+            DxvkCmdBuffer             cmdBuffer) {
+      m_vkd->vkCmdEndRendering(getCmdBuffer(cmdBuffer));
     }
 
-    
+
     void cmdEndTransformFeedback(
             uint32_t                  firstBuffer,
             uint32_t                  bufferCount,
@@ -1111,6 +1114,15 @@ namespace dxvk {
     }
 
     
+    void cmdSetSampleLocations(
+            VkBool32                enable,
+      const VkSampleLocationsInfoEXT* sampleLocations) {
+      VkCommandBuffer cmdBuffer = getCmdBuffer();
+
+      m_vkd->vkCmdSetSampleLocationsEnableEXT(cmdBuffer, enable);
+      m_vkd->vkCmdSetSampleLocationsEXT(cmdBuffer, sampleLocations);
+    }
+
     void cmdSetScissor(
             uint32_t                scissorCount,
       const VkRect2D*               scissors) {
@@ -1229,15 +1241,8 @@ namespace dxvk {
 
 
     void setDescriptorPool(
-            Rc<DxvkDescriptorPool>        pool,
-            Rc<DxvkDescriptorPoolSet>     manager) {
-      if (m_descriptorPool && m_descriptorPool != pool) {
-        m_descriptorPool->updateStats(m_statCounters);
-        m_descriptorPools.push_back({ std::move(m_descriptorPool), std::move(m_descriptorManager) });
-      }
-
-      m_descriptorPool = std::move(pool);
-      m_descriptorManager = std::move(manager);
+            Rc<DxvkDescriptorPool>        pool) {
+      m_descriptorPool = pool;
     }
 
 
@@ -1280,12 +1285,9 @@ namespace dxvk {
     small_vector<DxvkCommandSubmissionInfo, 4> m_cmdSubmissions;
     small_vector<DxvkSparseBindSubmission, 4>  m_cmdSparseBinds;
     
-    std::vector<std::pair<
-      Rc<DxvkDescriptorPool>,
-      Rc<DxvkDescriptorPoolSet>>> m_descriptorPools;
+    std::vector<Rc<DxvkDescriptorPool>> m_descriptorPools;
 
     Rc<DxvkDescriptorPool>    m_descriptorPool;
-    Rc<DxvkDescriptorPoolSet> m_descriptorManager;
     sync::SyncPoint           m_descriptorSync;
 
     Rc<DxvkResourceDescriptorHeap>  m_descriptorHeap;

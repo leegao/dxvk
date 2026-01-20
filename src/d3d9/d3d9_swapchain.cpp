@@ -504,7 +504,7 @@ namespace dxvk {
     // Assume there's 20 lines in a vBlank.
     constexpr uint32_t vBlankLineCount = 20;
 
-    if (pRasterStatus == nullptr)
+    if (unlikely(pRasterStatus == nullptr))
       return D3DERR_INVALIDCALL;
 
     D3DDISPLAYMODEEX mode;
@@ -532,7 +532,7 @@ namespace dxvk {
 
   
   HRESULT STDMETHODCALLTYPE D3D9SwapChainEx::GetDisplayMode(D3DDISPLAYMODE* pMode) {
-    if (pMode == nullptr)
+    if (unlikely(pMode == nullptr))
       return D3DERR_INVALIDCALL;
 
     *pMode = D3DDISPLAYMODE();
@@ -554,7 +554,7 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9SwapChainEx::GetPresentParameters(D3DPRESENT_PARAMETERS* pPresentationParameters) {
-    if (pPresentationParameters == nullptr)
+    if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
     *pPresentationParameters = m_presentParams;
@@ -564,25 +564,44 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9SwapChainEx::GetLastPresentCount(UINT* pLastPresentCount) {
-    Logger::warn("D3D9SwapChainEx::GetLastPresentCount: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D9SwapChainEx::GetLastPresentCount: Stub");
+
+    if (likely(pLastPresentCount != nullptr))
+      *pLastPresentCount = 0;
+
     return D3D_OK;
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D9SwapChainEx::GetPresentStats(D3DPRESENTSTATS* pPresentationStatistics) {
-    Logger::warn("D3D9SwapChainEx::GetPresentStats: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D9SwapChainEx::GetPresentStats: Stub");
+
+    if (likely(pPresentationStatistics != nullptr)) {
+      D3DPRESENTSTATS presentationStatistics = { };
+      *pPresentationStatistics = presentationStatistics;
+    }
+
     return D3D_OK;
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D9SwapChainEx::GetDisplayModeEx(D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) {
-    if (pMode == nullptr && pRotation == nullptr)
+    if (unlikely(pMode == nullptr && pRotation == nullptr))
       return D3DERR_INVALIDCALL;
 
     if (pRotation != nullptr)
       *pRotation = D3DDISPLAYROTATION_IDENTITY;
 
     if (pMode != nullptr) {
+      if (unlikely(pMode->Size != sizeof(D3DDISPLAYMODEEX)))
+        return D3DERR_INVALIDCALL;
+
       wsi::WsiMode devMode = { };
 
       if (!wsi::getCurrentDisplayMode(wsi::getDefaultMonitor(), &devMode)) {
@@ -931,7 +950,7 @@ namespace dxvk {
     for (uint32_t i = 1; i < rotatingBufferCount; i++)
       m_backBuffers[i]->Swap(m_backBuffers[i - 1].ptr());
 
-    m_parent->m_flags.set(D3D9DeviceFlag::DirtyFramebuffer);
+    m_parent->m_dirty.set(D3D9DeviceDirtyFlag::Framebuffer);
   }
 
 
@@ -998,7 +1017,7 @@ namespace dxvk {
     // creating a new one to free up resources
     DestroyBackBuffers();
 
-    int frontBufferCount = (SwapWithFrontBuffer() || m_parent->GetOptions()->extraFrontbuffer) ? 1 : 0;
+    const uint32_t frontBufferCount = (SwapWithFrontBuffer() || m_parent->GetOptions()->extraFrontbuffer) ? 1 : 0;
     const uint32_t bufferCount = NumBackBuffers + frontBufferCount;
 
     m_backBuffers.reserve(bufferCount);
@@ -1101,19 +1120,20 @@ namespace dxvk {
 
 
   void D3D9SwapChainEx::UpdateTargetFrameRate(uint32_t SyncInterval) {
-    double frameRateOption = double(m_parent->GetOptions()->maxFrameRate);
-    double frameRate = std::max(frameRateOption, 0.0);
+    double frameRate = double(m_parent->GetOptions()->maxFrameRate);
 
-    if (frameRateOption == 0.0 && SyncInterval) {
-      bool engageLimiter = SyncInterval > 1u || m_monitor ||
-        m_device->config().latencySleep == Tristate::True;
+    if (frameRate != -1.0) {
+      if (frameRate == 0.0 && SyncInterval) {
+        bool engageLimiter = SyncInterval > 1u || m_monitor ||
+          m_device->config().latencySleep == Tristate::True;
 
-      if (engageLimiter)
-        frameRate = -m_displayRefreshRate / double(SyncInterval);
+        if (engageLimiter)
+          frameRate = -m_displayRefreshRate / double(SyncInterval);
+      }
+
+      m_wctx->presenter->setFrameRateLimit(frameRate, GetActualFrameLatency());
+      m_targetFrameRate = frameRate;
     }
-
-    m_wctx->presenter->setFrameRateLimit(frameRate, GetActualFrameLatency());
-    m_targetFrameRate = frameRate;
   }
 
 
@@ -1163,7 +1183,7 @@ namespace dxvk {
         return { VK_FORMAT_B5G6R5_UNORM_PACK16, m_colorspace };
 
       case D3D9Format::A16B16G16R16F: {
-        if (!m_unlockAdditionalFormats) {
+        if (!m_parent->HasFormatsUnlocked()) {
           Logger::warn(str::format("D3D9SwapChainEx: Unexpected format: ", format));
           return VkSurfaceFormatKHR { };
         }
@@ -1220,6 +1240,8 @@ namespace dxvk {
     
     m_monitor = wsi::getDefaultMonitor();
 
+    wsi::saveWindowState(m_window, &m_windowState, true);
+
     if (!wsi::enterFullscreenMode(m_monitor, m_window, &m_windowState, true)) {
         Logger::err("D3D9: EnterFullscreenMode: Failed to enter fullscreen mode");
         return D3DERR_INVALIDCALL;
@@ -1242,10 +1264,11 @@ namespace dxvk {
 
     ResetWindowProc(m_window);
     
-    if (!wsi::leaveFullscreenMode(m_window, &m_windowState, false)) {
+    if (!wsi::leaveFullscreenMode(m_window, &m_windowState)) {
       Logger::err("D3D9: LeaveFullscreenMode: Failed to exit fullscreen mode");
       return D3DERR_NOTAVAILABLE;
     }
+    wsi::restoreWindowState(m_window, &m_windowState, false);
 
     m_parent->NotifyFullscreen(m_window, false);
     
@@ -1459,7 +1482,14 @@ namespace dxvk {
   }
 
   void STDMETHODCALLTYPE D3D9VkExtSwapchain::UnlockAdditionalFormats() {
-    m_swapchain->m_unlockAdditionalFormats = true;
+    Logger::err("ID3D9VkExtSwapchain::UnlockAdditionalFormats is deprecated.\n"
+                "Please use ID3D9VkExtInterface::UnlockAdditionalFormats instead.\n");
+
+    Com<ID3D9VkExtInterface> iface;
+
+    if (SUCCEEDED(m_swapchain->GetParent()->QueryInterface(
+        __uuidof(ID3D9VkExtInterface), reinterpret_cast<void**>(&iface))))
+      iface->UnlockAdditionalFormats();
   }
 
 }

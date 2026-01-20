@@ -20,11 +20,7 @@ namespace dxvk {
   static constexpr uint32_t SamplerStateCount = D3DSAMP_DMAPOFFSET + 1;
   static constexpr uint32_t SamplerCount      = caps::MaxTexturesPS + caps::MaxTexturesVS + 1;
   static constexpr uint32_t TextureStageStateCount = DXVK_TSS_COUNT;
-
-  namespace hacks::PointSize {
-    static constexpr DWORD AlphaToCoverageDisabled = MAKEFOURCC('A', '2', 'M', '0');
-    static constexpr DWORD AlphaToCoverageEnabled  = MAKEFOURCC('A', '2', 'M', '1');
-  }
+  static constexpr uint32_t PaletteEntryCount = 256;
   
   struct D3D9ClipPlane {
     float coeff[4] = {};
@@ -113,6 +109,66 @@ namespace dxvk {
     float Phi;
   };
 
+  struct D3D9FFShaderKeyVSData {
+    union {
+      struct {
+        uint32_t TexcoordIndices : 24;
+
+        uint32_t VertexHasPositionT : 1;
+
+        uint32_t VertexHasColor0 : 1; // Diffuse
+        uint32_t VertexHasColor1 : 1; // Specular
+
+        uint32_t VertexHasPointSize : 1;
+
+        uint32_t UseLighting : 1;
+
+        uint32_t NormalizeNormals : 1;
+        uint32_t LocalViewer : 1;
+        uint32_t RangeFog : 1;
+
+        // End of uint32_t
+
+        uint32_t TexcoordFlags : 24;
+
+        uint32_t DiffuseSource : 2;
+        uint32_t AmbientSource : 2;
+        uint32_t SpecularSource : 2;
+        uint32_t EmissiveSource : 2;
+
+        // Next uint32_t
+
+        uint32_t TransformFlags : 24;
+
+        uint32_t LightCount : 4;
+        uint32_t SpecularEnabled : 1;
+
+        // End of uint32_t
+
+        uint32_t VertexTexcoordDeclMask : 24;
+        uint32_t VertexHasFog : 1;
+
+        uint32_t VertexBlendMode    : 2;
+        uint32_t VertexBlendIndexed : 1;
+        uint32_t VertexBlendCount   : 2;
+
+        uint32_t VertexClipping     : 1;
+
+        // End of uint32_t
+      } Contents;
+
+      uint32_t Primitive[5];
+    };
+  };
+
+  struct D3D9FFShaderKeyVS {
+    D3D9FFShaderKeyVS() {
+      // memcmp safety
+      std::memset(&Data, 0, sizeof(Data));
+    }
+
+    D3D9FFShaderKeyVSData Data;
+  };
 
   struct D3D9FixedFunctionVS {
     Matrix4 WorldView;
@@ -128,6 +184,8 @@ namespace dxvk {
     std::array<D3D9Light, caps::MaxEnabledLights> Lights;
     D3DMATERIAL9 Material;
     float TweenFactor;
+
+    D3D9FFShaderKeyVSData Key;
   };
 
 
@@ -141,8 +199,48 @@ namespace dxvk {
   };
 
 
+  struct D3D9FFShaderStage {
+    union {
+      struct {
+        uint32_t     ColorOp   : 5;
+        uint32_t     ColorArg0 : 6;
+        uint32_t     ColorArg1 : 6;
+        uint32_t     ColorArg2 : 6;
+
+        uint32_t     AlphaOp   : 5;
+        uint32_t     AlphaArg0 : 6;
+        uint32_t     AlphaArg1 : 6;
+        uint32_t     AlphaArg2 : 6;
+
+        uint32_t     ResultIsTemp : 1;
+
+        // Included in here, read from Stage 0 for packing reasons
+        // Affects all stages.
+        uint32_t     GlobalSpecularEnable : 1;
+      } Contents;
+
+      uint32_t Primitive[2];
+    };
+  };
+
+  struct D3D9FFShaderKeyFS {
+    D3D9FFShaderKeyFS() {
+      // memcmp safety
+      std::memset(Stages, 0, sizeof(Stages));
+
+      // Normalize this. DISABLE != 0.
+      for (uint32_t i = 0; i < caps::TextureStageCount; i++) {
+        Stages[i].Contents.ColorOp = D3DTOP_DISABLE;
+        Stages[i].Contents.AlphaOp = D3DTOP_DISABLE;
+      }
+    }
+
+    D3D9FFShaderStage Stages[caps::TextureStageCount];
+  };
+
   struct D3D9FixedFunctionPS {
     Vector4 textureFactor;
+    D3D9FFShaderKeyFS Key;
   };
 
   enum D3D9SharedPSStages {
@@ -292,6 +390,11 @@ namespace dxvk {
       std::array<DWORD, TextureStageStateCount>,
       caps::TextureStageCount>>                         textureStages = {};
 
+    std::unordered_map<
+       UINT,
+       std::array<PALETTEENTRY, PaletteEntryCount>>     texturePalettes;
+    UINT                                                texturePaletteNumber = 0u;
+
     ItemType<D3D9ShaderConstantsVSSoftware>             vsConsts;
     ItemType<D3D9ShaderConstantsPS>                     psConsts;
 
@@ -303,6 +406,8 @@ namespace dxvk {
 
     std::vector<std::optional<D3DLIGHT9>>               lights;
     std::array<DWORD, caps::MaxEnabledLights>           enabledLightIndices;
+
+    float                                               nPatchSegments = 0.0f;
 
     bool IsLightEnabled(DWORD Index) const {
       const auto& enabledIndices = enabledLightIndices;

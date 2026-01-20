@@ -2,6 +2,8 @@
 #include "dxvk_instance.h"
 #include "dxvk_latency_builtin.h"
 #include "dxvk_latency_reflex.h"
+#include "dxvk_shader_cache.h"
+#include "dxvk_shader_ir.h"
 
 namespace dxvk {
   
@@ -24,10 +26,29 @@ namespace dxvk {
     m_objects           (this),
     m_submissionQueue   (this, queueCallback) {
 
+    if (adapter->kmtLocal()) {
+      D3DKMT_CREATEDEVICE create = { };
+      create.hAdapter = adapter->kmtLocal();
+      if (D3DKMTCreateDevice(&create))
+        Logger::warn("Failed to create D3DKMT device");
+      else
+        m_kmtLocal = create.hDevice;
+    }
+
+    determineShaderOptions();
+
+    if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
+      m_shaderCache = DxvkShaderCache::getInstance();
   }
   
   
   DxvkDevice::~DxvkDevice() {
+    if (m_kmtLocal) {
+      D3DKMT_DESTROYDEVICE destroy = { };
+      destroy.hDevice = m_kmtLocal;
+      D3DKMTDestroyDevice(&destroy);
+    }
+
     // If we are being destroyed during/after DLL process detachment
     // from TerminateProcess, etc, our CS threads are already destroyed
     // and we cannot synchronize against them.
@@ -105,6 +126,14 @@ namespace dxvk {
     return m_features.vk13.pipelineCreationCacheControl
         && m_features.extShaderModuleIdentifier.shaderModuleIdentifier
         && m_options.enableGraphicsPipelineLibrary != Tristate::True;
+  }
+
+
+  bool DxvkDevice::canUseSampleLocations(VkSampleCountFlags samples) const {
+    return (m_features.extSampleLocations)
+        && (m_features.extExtendedDynamicState3.extendedDynamicState3SampleLocationsEnable)
+        && (m_properties.extSampleLocations.variableSampleLocations)
+        && (m_properties.extSampleLocations.sampleLocationSampleCounts & samples) == samples;
   }
 
 
@@ -273,9 +302,12 @@ namespace dxvk {
     if (canUseDescriptorBuffer())
       pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
-    VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, &pipelineFlags };
+    VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     pipelineInfo.layout = layout->getPipelineLayout();
     pipelineInfo.basePipelineIndex = -1;
+
+    if (pipelineFlags.flags)
+      pipelineFlags.pNext = std::exchange(pipelineInfo.pNext, &pipelineFlags);
 
     VkPipelineShaderStageCreateInfo& stageInfo = pipelineInfo.stage;
     stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &moduleInfo };
@@ -418,12 +450,12 @@ namespace dxvk {
     if (state.depthFormat && (depthFormatInfo->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT))
       renderingInfo.stencilAttachmentFormat = state.depthFormat;
 
-    VkPipelineCreateFlags2CreateInfo pipelineFlags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, &renderingInfo };
+    VkPipelineCreateFlags2CreateInfo pipelineFlags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 
     if (canUseDescriptorBuffer())
       pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
-    VkGraphicsPipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pipelineFlags };
+    VkGraphicsPipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &renderingInfo };
     pipelineInfo.stageCount = stageInfos.size();
     pipelineInfo.pStages = stageInfos.data();
     pipelineInfo.pVertexInputState = state.viState ? state.viState : &viState;
@@ -436,6 +468,9 @@ namespace dxvk {
     pipelineInfo.pDynamicState = &dyState;
     pipelineInfo.layout = layout->getPipelineLayout();
     pipelineInfo.basePipelineIndex = -1;
+
+    if (pipelineFlags.flags)
+      pipelineFlags.pNext = std::exchange(pipelineInfo.pNext, &pipelineFlags);
 
     VkPipeline pipeline = VK_NULL_HANDLE;
 
@@ -467,6 +502,26 @@ namespace dxvk {
   }
   
   
+  Rc<DxvkShader> DxvkDevice::createCachedShader(
+    const std::string&                    name,
+    const DxvkIrShaderCreateInfo&         createInfo,
+    const Rc<DxvkIrShaderConverter>&      converter) {
+    Rc<DxvkIrShader> shader = nullptr;
+
+    if (m_shaderCache && !converter)
+      shader = m_shaderCache->lookupShader(name, createInfo);
+
+    if (!shader && converter) {
+      shader = new DxvkIrShader(createInfo, converter);
+
+      if (m_shaderCache)
+        m_shaderCache->addShader(shader);
+    }
+
+    return shader;
+  }
+
+
   Rc<DxvkBuffer> DxvkDevice::importBuffer(
     const DxvkBufferCreateInfo& createInfo,
     const DxvkBufferImportInfo& importInfo,
@@ -627,8 +682,10 @@ namespace dxvk {
   
   DxvkDevicePerfHints DxvkDevice::getPerfHints() {
     DxvkDevicePerfHints hints;
+
+    // RADV properly fuses depth-stencil copies now
     hints.preferFbDepthStencilCopy = m_features.extShaderStencilExport
-      && (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR)
+      && (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR, Version(), Version(25, 3, 99))
        || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE_KHR)
        || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY_KHR));
 
@@ -671,5 +728,132 @@ namespace dxvk {
   void DxvkDevice::recycleCommandList(const Rc<DxvkCommandList>& cmdList) {
     m_recycledCommandLists.returnObject(cmdList);
   }
-  
+
+
+  void DxvkDevice::determineShaderOptions() {
+    m_shaderOptions.minStorageBufferAlignment =
+      m_properties.core.properties.limits.minStorageBufferOffsetAlignment;
+
+    if (m_features.core.features.shaderInt16 && m_features.vk12.shaderFloat16)
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::Supports16BitArithmetic);
+
+    // RADV currently does not emit great code with 16-bit sampler indices
+    if (m_features.core.features.shaderInt16 && m_features.vk11.storagePushConstant16
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV))
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::Supports16BitPushData);
+
+    // Need to tag typed storage image loads with the format on some devices
+    auto r32Features = getFormatFeatures(VK_FORMAT_R32_SFLOAT).optimal
+                     & getFormatFeatures(VK_FORMAT_R32_UINT).optimal
+                     & getFormatFeatures(VK_FORMAT_R32_SINT).optimal;
+
+    if (!(r32Features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::TypedR32LoadRequiresFormat);
+
+    // Intel's hardware sin/cos is so inaccurate that it causes rendering issues in some games
+    bool lowerSinCos = m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
+                    || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
+    applyTristate(lowerSinCos, m_options.lowerSinCos);
+
+
+    if (lowerSinCos)
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerSinCos);
+
+    // RADV generally does the right thing for f32tof16 and int conversions by default
+    if (!m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)) {
+      m_shaderOptions.flags.set(
+        DxvkShaderCompileFlag::LowerFtoI,
+        DxvkShaderCompileFlag::LowerF32toF16);
+    }
+
+    // Converting unsigned integers to float should return an unsigned float,
+    // but Nvidia drivers prior to 580 don't agree
+    if (m_adapter->matchesDriver(VK_DRIVER_ID_NVIDIA_PROPRIETARY, Version(), Version(580u, 0u, 0u)))
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerItoF);
+
+    // Forward UBO device limit as-is
+    m_shaderOptions.maxUniformBufferSize = m_properties.core.properties.limits.maxUniformBufferRange;
+    m_shaderOptions.maxUniformBufferCount = m_properties.core.properties.limits.maxPerStageDescriptorUniformBuffers < MaxNumUniformBufferSlots
+      ? int32_t(m_properties.core.properties.limits.maxPerStageDescriptorUniformBuffers)
+      : -1;
+
+    // ANV up to mesa 25.0.2 breaks when we *don't* explicitly write point size
+    if (m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, Version(), Version(25, 0, 3)))
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::ExportPointSize);
+
+    if (m_features.nvRawAccessChains.shaderRawAccessChains)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsNvRawAccessChains);
+
+    // Mesa drivers generally optimize large constant arrays to a buffer, some other
+    // drivers do not and suffer a significant performance loss. Enable lowering on
+    // those drivers.
+    if (!m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_NVK)
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_TURNIP)
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_HONEYKRISP)
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_LLVMPIPE)
+     && !m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA))
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerConstantArrays);
+
+    // Set up float control feature flags
+    if (m_properties.vk12.shaderSignedZeroInfNanPreserveFloat16)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsSzInfNanPreserve16);
+    if (m_properties.vk12.shaderSignedZeroInfNanPreserveFloat32)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsSzInfNanPreserve32);
+    if (m_properties.vk12.shaderSignedZeroInfNanPreserveFloat64)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsSzInfNanPreserve64);
+
+    if (m_properties.vk12.shaderRoundingModeRTEFloat16)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRte16);
+    if (m_properties.vk12.shaderRoundingModeRTEFloat32)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRte32);
+    if (m_properties.vk12.shaderRoundingModeRTEFloat64)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRte64);
+
+    if (m_properties.vk12.shaderRoundingModeRTZFloat16)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRtz16);
+    if (m_properties.vk12.shaderRoundingModeRTZFloat32)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRtz32);
+    if (m_properties.vk12.shaderRoundingModeRTZFloat64)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsRtz64);
+
+    if (m_properties.vk12.shaderDenormFlushToZeroFloat16)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormFlush16);
+    if (m_properties.vk12.shaderDenormFlushToZeroFloat32)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormFlush32);
+    if (m_properties.vk12.shaderDenormFlushToZeroFloat64)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormFlush64);
+
+    if (m_properties.vk12.shaderDenormPreserveFloat16)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormPreserve16);
+    if (m_properties.vk12.shaderDenormPreserveFloat32)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormPreserve32);
+    if (m_properties.vk12.shaderDenormPreserveFloat64)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDenormPreserve64);
+
+    if (m_properties.vk12.roundingModeIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::IndependentRoundMode);
+
+    if (m_properties.vk12.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::IndependentDenormMode);
+
+    if (m_features.khrShaderFloatControls2.shaderFloatControls2)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsFloatControls2);
+
+    // Set up resource indexing flags
+    if (m_features.core.features.shaderUniformBufferArrayDynamicIndexing &&
+        m_features.core.features.shaderSampledImageArrayDynamicIndexing &&
+        m_features.core.features.shaderStorageBufferArrayDynamicIndexing &&
+        m_features.core.features.shaderStorageImageArrayDynamicIndexing &&
+        m_features.vk12.shaderUniformTexelBufferArrayDynamicIndexing &&
+        m_features.vk12.shaderStorageTexelBufferArrayDynamicIndexing &&
+        m_features.vk12.shaderUniformBufferArrayNonUniformIndexing &&
+        m_features.vk12.shaderSampledImageArrayNonUniformIndexing &&
+        m_features.vk12.shaderStorageBufferArrayNonUniformIndexing &&
+        m_features.vk12.shaderStorageImageArrayNonUniformIndexing &&
+        m_features.vk12.shaderUniformTexelBufferArrayNonUniformIndexing &&
+        m_features.vk12.shaderStorageTexelBufferArrayNonUniformIndexing)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsResourceIndexing);
+  }
+
 }

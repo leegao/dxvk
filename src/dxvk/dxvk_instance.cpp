@@ -159,15 +159,21 @@ namespace dxvk {
         ext->specVersion = entry->specVersion;
     }
 
+    // Only enable one of the surface maintenance extensions
+    if (m_extensionInfo.khrSurfaceMaintenance1.specVersion)
+      m_extensionInfo.extSurfaceMaintenance1.specVersion = 0u;
+
     // Hide debug mode behind an environment variable since it adds
     // significant overhead, and some games will not work with it enabled.
     std::string debugEnv = env::getEnvVar("DXVK_DEBUG");
+
+    bool capture = debugEnv.empty() && env::getEnvVar("ENABLE_VULKAN_RENDERDOC_CAPTURE") == "1";
 
     if (debugEnv == "validation")
       m_debugFlags.set(DxvkDebugFlag::Validation);
     else if (debugEnv == "markers")
       m_debugFlags.set(DxvkDebugFlag::Capture, DxvkDebugFlag::Markers);
-    else if (debugEnv == "capture" || m_options.enableDebugUtils)
+    else if (debugEnv == "capture" || m_options.enableDebugUtils || capture)
       m_debugFlags.set(DxvkDebugFlag::Capture);
 
     if (m_debugFlags.isClear()) {
@@ -226,7 +232,7 @@ namespace dxvk {
       std::vector<const char*> extensionNames;
 
       for (const auto& layer : layersEnabled)
-        extensionNames.push_back(layer.c_str());
+        layerNames.push_back(layer.c_str());
 
       for (const auto& ext : extensionsEnabled)
         extensionNames.push_back(ext.extensionName);
@@ -235,7 +241,7 @@ namespace dxvk {
       appInfo.pApplicationName      = appName.c_str();
       appInfo.applicationVersion    = flags.raw();
       appInfo.pEngineName           = "DXVK";
-      appInfo.engineVersion         = VK_MAKE_API_VERSION(0, 2, 7, 0);
+      appInfo.engineVersion         = VK_MAKE_API_VERSION(0, 2, 7, 1);
       appInfo.apiVersion            = DxvkVulkanApiVersion;
 
       VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
@@ -364,6 +370,7 @@ namespace dxvk {
       &extensions.extSurfaceMaintenance1,
       &extensions.khrGetSurfaceCapabilities2,
       &extensions.khrSurface,
+      &extensions.khrSurfaceMaintenance1,
     }};
   }
 

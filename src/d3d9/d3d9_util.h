@@ -146,7 +146,6 @@ namespace dxvk {
           ID3DBlob** ppDisassembly);
 
   HRESULT DecodeMultiSampleType(
-    const Rc<DxvkDevice>&           pDevice,
           D3DMULTISAMPLE_TYPE       MultiSample,
           DWORD                     MultisampleQuality,
           VkSampleCountFlagBits*    pSampleCount);
@@ -266,13 +265,6 @@ namespace dxvk {
     return count;
   }
 
-  bool IsDepthFormat(D3D9Format Format);
-
-  bool IsDepthStencilFormat(D3D9Format Format);
-
-  bool IsLockableDepthStencilFormat(D3D9Format Format);
-
-
   inline bool IsPoolManaged(D3DPOOL Pool) {
     return Pool == D3DPOOL_MANAGED || Pool == D3DPOOL_MANAGED_EX;
   }
@@ -357,6 +349,9 @@ inline bool operator != (const D3DVIEWPORT9& a, const D3DVIEWPORT9& b) {
   return !(a == b);
 }
 
+
+// Missing in some versions of mingw headers
+#ifndef _MSC_VER
 inline bool operator == (const RECT& a, const RECT& b) {
   return a.left   == b.left  &&
          a.right  == b.right &&
@@ -367,6 +362,7 @@ inline bool operator == (const RECT& a, const RECT& b) {
 inline bool operator != (const RECT& a, const RECT& b) {
   return !(a == b);
 }
+#endif /* _MSC_VER */
 
 inline bool operator == (const POINT& a, const POINT& b) {
   return a.x == b.x && a.y == b.y;
