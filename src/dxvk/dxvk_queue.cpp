@@ -219,10 +219,17 @@ namespace dxvk {
   }
   
   
+#define NEW_CODE
+
   void DxvkSubmissionQueue::finishCmdLists() {
     env::setThreadName("dxvk-queue");
 
     auto vk = m_device->vkd();
+
+#ifdef NEW_CODE
+    std::vector<DxvkSubmitEntry> batch;
+    batch.reserve(16);
+#endif
 
     while (!m_stopped.load()) {
       std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -241,9 +248,71 @@ namespace dxvk {
       if (m_stopped.load())
         return;
       
+#ifdef NEW_CODE
+      while (!m_finishQueue.empty() && batch.size() < 16) {
+        batch.push_back(std::move(m_finishQueue.front()));
+        m_finishQueue.pop();
+      }
+#else
       DxvkSubmitEntry entry = std::move(m_finishQueue.front());
+#endif
       lock.unlock();
-      
+
+#ifdef NEW_CODE
+      uint64_t maxGraphics = 0;
+      uint64_t maxTransfer = 0;
+      bool hasWait = false;
+
+      for (const auto& entry : batch) {
+        if (entry.submit.cmdList != nullptr) {
+          maxGraphics = std::max(maxGraphics, entry.timelines.graphics);
+          maxTransfer = std::max(maxTransfer, entry.timelines.transfer);
+          hasWait = true;
+        }
+      }
+
+      VkResult status = m_lastError.load();
+
+      // Single wait per batch
+      if (hasWait && status != VK_ERROR_DEVICE_LOST) {
+        std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
+        std::array<uint64_t, 2> timelines = { maxGraphics, maxTransfer };
+
+        VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        waitInfo.semaphoreCount = semaphores.size();
+        waitInfo.pSemaphores = semaphores.data();
+        waitInfo.pValues = timelines.data();
+
+        // On Turnip this takes the global driver lock ONCE per batch
+        status = vk->vkWaitSemaphores(vk->device(), &waitInfo, ~0ull);
+      }
+
+      if (status != VK_SUCCESS) {
+        m_lastError = status;
+        if (status != VK_ERROR_DEVICE_LOST)
+          m_device->waitForIdle();
+      }
+
+      for (auto& entry : batch) {
+        if (entry.submit.cmdList != nullptr) {
+          if (entry.latency.tracker && status == VK_SUCCESS)
+            entry.latency.tracker->notifyGpuExecutionEnd(entry.latency.frameId);
+          
+          entry.submit.cmdList->notifyObjects();
+          entry.submit.cmdList->reset();
+          m_device->recycleCommandList(entry.submit.cmdList);
+        } else if (entry.present.presenter != nullptr) {
+          entry.present.presenter->signalFrame(entry.present.frameId, entry.latency.tracker);
+          entry.present.presenter = nullptr;
+        }
+      }
+
+      batch.clear();
+
+      lock.lock();
+      m_finishCond.notify_all();
+      lock.unlock();
+#else
       if (entry.submit.cmdList != nullptr) {
         VkResult status = m_lastError.load();
 
@@ -295,6 +364,7 @@ namespace dxvk {
         entry.submit.cmdList->reset();
         m_device->recycleCommandList(entry.submit.cmdList);
       }
+#endif
     }
   }
   
